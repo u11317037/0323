@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-Hant" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>03-02 顏色追蹤</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet" />
+    <style>body { font-family: Inter, sans-serif; }</style>
+  </head>
+  <body class="min-h-screen bg-slate-950 p-6 text-slate-100">
+    <a class="text-cyan-400 hover:text-lime-400" href="index.html">← 返回課程表</a>
+    <div class="mx-auto mt-6 max-w-3xl">
+      <h1 class="mb-4 text-xl font-semibold">練習 03-02｜顏色追蹤</h1>
+      <p class="mb-2 text-sm text-slate-400">
+        <strong>音樂開關色</strong> RGB ≈ (48, 137, 69)：偵測到時<strong>播放</strong> <code class="text-cyan-300">music.mp3</code>，拿走／消失則<strong>停止</strong>。
+        <strong>追蹤／音量色</strong> RGB ≈ (0, 97, 151)：以紅框＋藍點的<strong>垂直位置</strong>控制音量（愈上愈大）。點擊畫面可重新校準「追蹤色」（不影響音樂開關色）。
+      </p>
+      <audio id="music" src="music.mp3" loop preload="auto"></audio>
+      <button id="start" class="mb-4 rounded-xl border border-cyan-400/50 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-200">
+        開啟攝影機
+      </button>
+      <div class="relative inline-block">
+        <video id="video" class="hidden" playsinline muted></video>
+        <canvas id="canvas" class="max-h-[70vh] rounded-lg border border-cyan-500/30 bg-black"></canvas>
+      </div>
+      <p id="status" class="mt-4 rounded-lg border border-slate-700 bg-slate-900/80 p-3 text-sm text-slate-300">
+        平均 RGB：—　距離：—
+      </p>
+    </div>
+    <script>
+      let target = { r: 0, g: 97, b: 151 };
+      /** 固定：此色出現 → 播放；拿走 → 停止 */
+      const MUSIC_TRIGGER_COLOR = { r: 48, g: 137, b: 69 };
+      const TRIGGER_TRACK_DIST_MAX = 70;
+      const MIN_BLOB_TRIGGER_CELLS = 16;
+
+      const DIST_MAX = 55;
+      const TRACK_DIST_MAX = 65;
+      const SAMPLE_STRIDE = 3;
+      const MIN_BLOB_CELLS = 18;
+      const MARKER_SIZE = 28;
+      const video = document.getElementById("video");
+      const canvas = document.getElementById("canvas");
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      const statusEl = document.getElementById("status");
+      const musicEl = document.getElementById("music");
+
+      /** 質心 y：畫面上方 → 音量高，下方 → 音量低（0～1） */
+      function volumeFromY(cy, canvasHeight) {
+        const denom = Math.max(canvasHeight - 1, 1);
+        return Math.max(0, Math.min(1, 1 - cy / denom));
+      }
+
+      function euclidean(a, b) {
+        return Math.sqrt(
+          (a.r - b.r) ** 2 + (a.g - b.g) ** 2 + (a.b - b.b) ** 2
+        );
+      }
+
+      function colorDist2To(r, g, b, ref) {
+        const dr = r - ref.r;
+        const dg = g - ref.g;
+        const db = b - ref.b;
+        return dr * dr + dg * dg + db * db;
+      }
+
+      /** 在降採樣格點上找「最大連通區塊」質心；colorRef 為要比對的 RGB */
+      function findLargestBlobCentroid(d, w, h, stride, trackDist2, colorRef, minCells) {
+        const minBlob = minCells ?? MIN_BLOB_CELLS;
+        const sw = Math.ceil(w / stride);
+        const sh = Math.ceil(h / stride);
+        const cells = sw * sh;
+        const mask = new Uint8Array(cells);
+        const parent = new Int32Array(cells);
+
+        for (let gy = 0; gy < sh; gy++) {
+          for (let gx = 0; gx < sw; gx++) {
+            const sx = Math.min(gx * stride, w - 1);
+            const sy = Math.min(gy * stride, h - 1);
+            const idx = (sy * w + sx) * 4;
+            const r = d[idx];
+            const g = d[idx + 1];
+            const b = d[idx + 2];
+            const i = gy * sw + gx;
+            if (colorDist2To(r, g, b, colorRef) < trackDist2) {
+              mask[i] = 1;
+              parent[i] = i;
+            } else {
+              parent[i] = -1;
+            }
+          }
+        }
+
+        function find(p) {
+          if (parent[p] < 0) return -1;
+          let root = p;
+          while (parent[root] !== root) root = parent[root];
+          let cur = p;
+          while (cur !== root) {
+            const next = parent[cur];
+            parent[cur] = root;
+            cur = next;
+          }
+          return root;
+        }
+
+        function union(a, b) {
+          const ra = find(a);
+          const rb = find(b);
+          if (ra < 0 || rb < 0 || ra === rb) return;
+          parent[rb] = ra;
+        }
+
+        for (let gy = 0; gy < sh; gy++) {
+          for (let gx = 0; gx < sw; gx++) {
+            const i = gy * sw + gx;
+            if (!mask[i]) continue;
+            if (gx > 0 && mask[i - 1]) union(i, i - 1);
+            if (gy > 0 && mask[i - sw]) union(i, i - sw);
+            if (gx > 0 && gy > 0 && mask[i - sw - 1]) union(i, i - sw - 1);
+            if (gx < sw - 1 && gy > 0 && mask[i - sw + 1]) union(i, i - sw + 1);
+          }
+        }
+
+        let bestCount = 0;
+        let bestSumX = 0;
+        let bestSumY = 0;
+
+        const aggCount = new Map();
+        const aggSumX = new Map();
+        const aggSumY = new Map();
+
+        for (let i = 0; i < cells; i++) {
+          if (!mask[i]) continue;
+          const root = find(i);
+          if (root < 0) continue;
+          const gx = i % sw;
+          const gy = (i / sw) | 0;
+          aggCount.set(root, (aggCount.get(root) || 0) + 1);
+          aggSumX.set(root, (aggSumX.get(root) || 0) + gx);
+          aggSumY.set(root, (aggSumY.get(root) || 0) + gy);
+        }
+
+        aggCount.forEach((count, root) => {
+          if (count > bestCount) {
+            bestCount = count;
+            bestSumX = aggSumX.get(root) || 0;
+            bestSumY = aggSumY.get(root) || 0;
+          }
+        });
+
+        if (bestCount < minBlob) return null;
+
+        const cxGrid = bestSumX / bestCount;
+        const cyGrid = bestSumY / bestCount;
+        const cx = cxGrid * stride + stride * 0.5;
+        const cy = cyGrid * stride + stride * 0.5;
+        return { cx, cy, blobCells: bestCount };
+      }
+
+      function loop() {
+        if (video.videoWidth) {
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const d = img.data;
+          const w = canvas.width;
+          const h = canvas.height;
+          let sr = 0,
+            sg = 0,
+            sb = 0,
+            n = 0;
+          for (let i = 0; i < d.length; i += 4) {
+            sr += d[i];
+            sg += d[i + 1];
+            sb += d[i + 2];
+            n++;
+          }
+          const avg = { r: sr / n, g: sg / n, b: sb / n };
+          const dist = euclidean(avg, target);
+          const ok = dist < DIST_MAX;
+          const trackDist2 = TRACK_DIST_MAX * TRACK_DIST_MAX;
+          const blob = findLargestBlobCentroid(
+            d,
+            w,
+            h,
+            SAMPLE_STRIDE,
+            trackDist2,
+            target,
+            MIN_BLOB_CELLS
+          );
+
+          const triggerDist2 = TRIGGER_TRACK_DIST_MAX * TRIGGER_TRACK_DIST_MAX;
+          const triggerBlob = findLargestBlobCentroid(
+            d,
+            w,
+            h,
+            SAMPLE_STRIDE,
+            triggerDist2,
+            MUSIC_TRIGGER_COLOR,
+            MIN_BLOB_TRIGGER_CELLS
+          );
+
+          if (musicEl) {
+            if (triggerBlob) {
+              if (musicEl.paused) {
+                musicEl.play().catch(() => {});
+              }
+            } else {
+              musicEl.pause();
+            }
+          }
+
+          let vol = 0;
+          if (blob) {
+            const { cx, cy } = blob;
+            vol = volumeFromY(cy, h);
+            if (musicEl && triggerBlob) musicEl.volume = vol;
+
+            ctx.strokeStyle = "rgba(239, 68, 68, 0.95)";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(cx - MARKER_SIZE / 2, cy - MARKER_SIZE / 2, MARKER_SIZE, MARKER_SIZE);
+            ctx.fillStyle = "rgba(59, 130, 246, 0.95)";
+            ctx.beginPath();
+            ctx.arc(cx, cy, 6, 0, Math.PI * 2);
+            ctx.fill();
+          } else if (musicEl && triggerBlob) {
+            musicEl.volume = 1;
+          }
+
+          statusEl.className =
+            "mt-4 rounded-lg border p-3 text-sm " +
+            (ok
+              ? "border-lime-400/60 bg-lime-950/50 text-lime-200"
+              : "border-slate-700 bg-slate-900/80 text-slate-300");
+          statusEl.textContent =
+            (triggerBlob ? "音樂：播放中（偵測到開關色） " : "音樂：停止（未偵測到開關色） ") +
+            (blob ? "追蹤色：偵測中 " : "追蹤色：未偵測 ") +
+            "｜開關色 RGB(48,137,69)　追蹤色：(" +
+            target.r.toFixed(0) +
+            ", " +
+            target.g.toFixed(0) +
+            ", " +
+            target.b.toFixed(0) +
+            ")　平均 RGB：(" +
+            avg.r.toFixed(0) +
+            ", " +
+            avg.g.toFixed(0) +
+            ", " +
+            avg.b.toFixed(0) +
+            ")　距離：" +
+            dist.toFixed(1) +
+            (blob && triggerBlob
+              ? "　物體格點數：" + blob.blobCells + "　音量：" + (vol * 100).toFixed(0) + "%（依藍點垂直位置）"
+              : triggerBlob
+                ? "　音量：100%（僅開關色、無追蹤色時）"
+                : "");
+        }
+        requestAnimationFrame(loop);
+      }
+
+      canvas.addEventListener("click", (event) => {
+        if (!canvas.width || !canvas.height) return;
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        const x = Math.max(0, Math.min(canvas.width - 1, Math.floor((event.clientX - rect.left) * scaleX)));
+        const y = Math.max(0, Math.min(canvas.height - 1, Math.floor((event.clientY - rect.top) * scaleY)));
+        const picked = ctx.getImageData(x, y, 1, 1).data;
+        target = { r: picked[0], g: picked[1], b: picked[2] };
+      });
+
+      document.getElementById("start").addEventListener("click", async () => {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+        video.srcObject = stream;
+        await video.play();
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        if (musicEl) {
+          musicEl.volume = 0;
+          try {
+            await musicEl.play();
+            musicEl.pause();
+            musicEl.currentTime = 0;
+          } catch (e) {
+            console.warn("無法解鎖音訊（請確認 music.mp3 存在，或瀏覽器允許音訊）", e);
+          }
+        }
+        loop();
+      });
+    </script>
+  </body>
+</html>
